@@ -1,0 +1,114 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Needed to create the release and upload its assets. Nothing else is granted:
+# the default token permissions are read-only, and this job writes only here.
+permissions:
+  contents: write
+
+jobs:
+  # Gate the release on the same checks build.sh runs locally. A tag that does
+  # not pass them should not produce a downloadable binary.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # The tunnel is concurrent throughout -- two copy goroutines per
+      # connection, a keepalive ticker, and a PTY reader -- so the race
+      # detector is worth the extra minute before anything ships.
+      - name: Test with the race detector
+        run: go test -race ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # --generate-notes builds the changelog from history, which is empty
+          # at depth 1.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          # Everything here is pure Go, so static binaries cross-compile
+          # cleanly and run on distroless and Alpine without a libc.
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          while read -r os arch; do
+            [ -n "$os" ] || continue
+            ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            out="dist/san_tunnels_${version}_${os}_${arch}${ext}"
+            echo "building $out"
+            GOOS="$os" GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${version}" \
+              -o "$out" \
+              ./cmd/san_tunnels
+          done <<'TARGETS'
+          linux amd64
+          linux arm64
+          darwin amd64
+          darwin arm64
+          windows amd64
+          windows arm64
+          TARGETS
+
+      # Published over HTTPS to machines people then SSH from, so a checksum
+      # file is the minimum needed to verify a download was not tampered with.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Verify the version stamp
+        run: |
+          set -euo pipefail
+          got="$(./dist/san_tunnels_${GITHUB_REF_NAME}_linux_amd64 --version)"
+          echo "$got"
+          case "$got" in
+            *"${GITHUB_REF_NAME}"*) ;;
+            *) echo "version stamp does not contain ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+
+      # gh is preinstalled on the runner. Using it rather than a third-party
+      # release action keeps the supply chain for a security tool down to
+      # GitHub's own first-party pieces.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            dist/*
