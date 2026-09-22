@@ -489,6 +489,11 @@ Not built yet, in rough order of how likely you are to hit them:
   resolves nowhere. `ssh box-01.tunnels.internal` fails in DNS before reaching
   any of this, so nothing here can explain it at the point it happens. Use
   `ssh box-01`; see [Troubleshooting](#troubleshooting).
+- **An upstream race on early resize.** `gliderlabs/ssh` v0.3.8 races between
+  `Session.Pty()` and its own `window-change` handling, so a client that
+  resizes the instant a session opens can read a torn window size — one resize
+  with a stale width or height, corrected by the next. The field is unexported,
+  so it cannot be fixed from here without patching upstream.
 - **No `hostkey --rotate`.**
 - **No metrics.** Nothing to alert on.
 - **Shutdown does not close WebSocket tunnels** — hijacked connections outlive

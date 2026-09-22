@@ -25,6 +25,20 @@ func (b *safeBuffer) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 
+// waitForOutput blocks until want appears in the session output, so a test can
+// act on the shell being established rather than on a guess about timing.
+func waitForOutput(t *testing.T, out *safeBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q in session output; got %q", want, out.String())
+}
+
 func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -120,6 +134,23 @@ func testPTYResize(t *testing.T, tr client.Transport) {
 	if err := sess.Shell(); err != nil {
 		t.Fatalf("start shell: %v", err)
 	}
+
+	// Resize only once the shell is actually up.
+	//
+	// gliderlabs/ssh v0.3.8 races on the pty between Session.Pty(), which
+	// copies *sess.pty (session.go:212), and its request loop writing
+	// sess.pty.Window on a window-change (session.go:352). The session
+	// handler runs in a goroutine the loop spawns while it keeps going, so a
+	// resize that arrives before the handler has read the pty races it.
+	//
+	// That is an upstream bug on an unexported field and nothing here can fix
+	// it; see "A race in gliderlabs" in the design doc. Waiting for output
+	// proves the read already happened, and resizing an established session
+	// is what a real client does anyway.
+	if _, err := io.WriteString(stdin, "echo before-resize\r"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitForOutput(t, &out, "before-resize")
 
 	if err := sess.WindowChange(50, 200); err != nil {
 		t.Fatalf("window change: %v", err)
