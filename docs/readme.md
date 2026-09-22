@@ -292,6 +292,13 @@ san_tunnels client connect box-01
 and the port moving then reads as the host key having changed. The alias keys
 it on the agent instead, so pinning survives.
 
+> ⚠️ **`box-01.tunnels.internal` is not a hostname.** As a `HostKeyAlias` it is
+> pure bookkeeping and resolves nowhere, by design. `ssh box-01.tunnels.internal`
+> therefore fails in DNS before any tunnel code runs. To reach an agent with
+> `ssh`, use its name (`ssh box-01`, via the ProxyCommand block). The alias only
+> becomes a real name after you add the hosts entries below, which is needed
+> solely for clients that cannot set `HostKeyAlias` themselves.
+
 **Pin the port** for anything you connect to repeatedly, especially from a GUI
 tool that saves a profile:
 
@@ -371,6 +378,28 @@ as mandatory whenever the agent is reachable by anything you do not control.
 ---
 
 ## Troubleshooting
+
+**`ssh: Could not resolve hostname box-01.tunnels.internal`.** That name is a
+bookkeeping label, not a hostname — nothing resolves it until you add the hosts
+entries `client hosts` prints. For `ssh` you almost never want to: use the
+agent name instead.
+
+```sh
+san_tunnels client config box-01 >> ~/.ssh/config
+ssh box-01
+```
+
+`%h` is resolved through the client config, not the resolver, so no DNS is
+involved at all. The `.tunnels.internal` form is only for GUI clients that
+cannot set `HostKeyAlias`; see [Local ports](#local-ports).
+
+**`ssh box-01` says `Could not resolve hostname box-01`.** There is no
+`Host box-01` block in `~/.ssh/config`, so `ssh` fell through to DNS. Append
+the block as above. `client list` shows the names that exist.
+
+**`ssh` logs in as the wrong user.** The agent has no `user` set, so the
+generated block has no `User` line and `ssh` uses your local username. Pass
+`--user` to `client add`, or `ssh deploy@box-01`.
 
 **`ssh` hangs with no output, no error.** The classic h2 downgrade. Run
 `san_tunnels client check <name>` — it turns the hang into a message naming
@@ -455,6 +484,11 @@ Not built yet, in rough order of how likely you are to hit them:
   sketched in the spec, which is an open decision, not an implementation gap.
 - **No session resumption.** A dropped connection kills the session; run `tmux`
   on the target.
+- **`.tunnels.internal` reads like a hostname but is not one.** `connect`
+  prints it inside an `ssh` command line, where it is a `HostKeyAlias` and
+  resolves nowhere. `ssh box-01.tunnels.internal` fails in DNS before reaching
+  any of this, so nothing here can explain it at the point it happens. Use
+  `ssh box-01`; see [Troubleshooting](#troubleshooting).
 - **No `hostkey --rotate`.**
 - **No metrics.** Nothing to alert on.
 - **Shutdown does not close WebSocket tunnels** — hijacked connections outlive
