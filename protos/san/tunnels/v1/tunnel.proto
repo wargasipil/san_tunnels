@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package san.tunnels.v1;
+
+option go_package = "github.com/wargasipil/san_tunnels/gen/san/tunnels/v1;tunnelsv1";
+
+// TunnelService moves opaque bytes. It never interprets what it carries: an SSH
+// session riding on Forward is encrypted end to end between the user's ssh
+// client and the agent's embedded SSH server.
+service TunnelService {
+  // Forward is one call per tunnelled TCP connection. The first client message
+  // must be `open`; every later one must be `data`.
+  //
+  // Requires HTTP/2. HTTP/1.1 cannot interleave a request and response body,
+  // and this stream is full-duplex by nature.
+  rpc Forward(stream ForwardRequest) returns (stream ForwardResponse);
+
+  // Ping is the duplex preflight probe. The client sends, reads a reply, then
+  // sends again; a half-duplex path cannot complete that round trip, which
+  // turns a silent mid-session hang into a loud failure at startup.
+  rpc Ping(stream PingRequest) returns (stream PingResponse);
+}
+
+message ForwardRequest {
+  oneof payload {
+    Open open = 1;
+    bytes data = 2;
+  }
+}
+
+message Open {
+  // A name resolved against the agent's allowlist, never a free-form
+  // host:port -- accepting an arbitrary address would make the agent an open
+  // relay that any token holder could pivot through.
+  //
+  //   "shell"    -> the in-process SSH server, no socket involved
+  //   "postgres" -> dial 127.0.0.1:5432
+  string endpoint = 1;
+}
+
+message ForwardResponse {
+  oneof payload {
+    Opened opened = 1;
+    bytes data = 2;
+  }
+}
+
+message Opened {}
+
+message PingRequest {
+  uint64 seq = 1;
+}
+
+message PingResponse {
+  uint64 seq = 1;
+}
