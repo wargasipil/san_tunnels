@@ -59,6 +59,10 @@ const (
 func New(ctx context.Context, c *websocket.Conn, local, remote string) *streamconn.Conn {
 	c.SetReadLimit(ReadLimit)
 
+	// Cancelled on Close so the keepalive goroutine cannot outlive the tunnel.
+	ctx, cancel := context.WithCancel(ctx)
+	go Keepalive(ctx, c, KeepaliveInterval, KeepaliveTimeout)
+
 	var once sync.Once
 	return streamconn.New(streamconn.Options{
 		Recv: func() ([]byte, error) {
@@ -92,6 +96,7 @@ func New(ctx context.Context, c *websocket.Conn, local, remote string) *streamco
 			return err
 		},
 		Close: func() error {
+			cancel()
 			return c.Close(websocket.StatusNormalClosure, "")
 		},
 		Local:  local,
@@ -106,6 +111,12 @@ func New(ctx context.Context, c *websocket.Conn, local, remote string) *streamco
 // close-write frame of its own.
 func NewServer(ctx context.Context, c *websocket.Conn, remote string) *streamconn.Conn {
 	c.SetReadLimit(ReadLimit)
+
+	// The agent pings too, rather than relying on the client to. A tunnel can
+	// be reaped from either end, and the side that notices first is whichever
+	// one's path broke.
+	ctx, cancel := context.WithCancel(ctx)
+	go Keepalive(ctx, c, KeepaliveInterval, KeepaliveTimeout)
 
 	return streamconn.New(streamconn.Options{
 		Recv: func() ([]byte, error) {
@@ -123,6 +134,10 @@ func NewServer(ctx context.Context, c *websocket.Conn, remote string) *streamcon
 		},
 		Send: func(b []byte) error {
 			return c.Write(ctx, websocket.MessageBinary, b)
+		},
+		Close: func() error {
+			cancel()
+			return nil
 		},
 		Local:  "agent",
 		Remote: remote,

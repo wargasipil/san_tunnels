@@ -53,7 +53,7 @@ func Check(ctx context.Context, t Target, timeout time.Duration) error {
 	if t.Transport == TransportWS {
 		return checkWS(ctx, t, timeout)
 	}
-	svc, err := newService(t)
+	svc, verifier, err := newService(t)
 	if err != nil {
 		return err
 	}
@@ -67,6 +67,9 @@ func Check(ctx context.Context, t Target, timeout time.Duration) error {
 	const rounds = 2
 	for i := uint64(1); i <= rounds; i++ {
 		if err := stream.Send(&v1.PingRequest{Seq: i}); err != nil {
+			if ve := verifier.get(); ve != nil {
+				return ve
+			}
 			return fmt.Errorf("ping %d to %s: %w", i, t.URL, err)
 		}
 		resp, err := stream.Receive()

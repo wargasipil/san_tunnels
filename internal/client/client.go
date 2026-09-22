@@ -56,6 +56,27 @@ type Target struct {
 	User      string
 	Insecure  bool
 	Transport Transport
+	// Port is the local port `connect` binds for this agent, 0 for any free
+	// one. It is part of the agent's identity to an ssh client, which records
+	// it in known_hosts alongside the host.
+	Port int
+	// TLSFingerprint pins the agent's certificate, in the agent's own
+	// "SHA256:..." format. Set, it is the only certificate accepted.
+	TLSFingerprint string
+	// Known enables trust on first use when no fingerprint is pinned.
+	Known *KnownAgents
+	// OnTrust is called the first time an agent's certificate is recorded, so
+	// the caller can say so on stderr rather than trusting it silently.
+	OnTrust func(name, fingerprint string)
+}
+
+// hostOf returns the hostname from a target URL, for certificate checks.
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // Conn is one tunnelled connection.
@@ -75,17 +96,18 @@ type Conn interface {
 // over TLS with ALPN and silently falls back to HTTP/1.1, which cannot carry a
 // full-duplex stream. Choosing http2.Transport makes the requirement a
 // decision rather than a negotiation nobody watched.
-func httpClient(t Target) (*http.Client, error) {
+func httpClient(t Target) (*http.Client, *tlsVerifier, error) {
+	v := &tlsVerifier{}
 	u, err := url.Parse(t.URL)
 	if err != nil {
-		return nil, fmt.Errorf("parse server url %q: %w", t.URL, err)
+		return nil, nil, fmt.Errorf("parse server url %q: %w", t.URL, err)
 	}
 
 	switch u.Scheme {
 	case "https":
 		return &http.Client{Transport: &http2.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: t.Insecure}, //nolint:gosec // opt-in, dev only
-		}}, nil
+			TLSClientConfig: tlsConfigFor(t, t.Known, t.OnTrust, v),
+		}}, v, nil
 	case "http":
 		// h2c: prior-knowledge HTTP/2 over cleartext, no upgrade dance.
 		return &http.Client{Transport: &http2.Transport{
@@ -94,19 +116,19 @@ func httpClient(t Target) (*http.Client, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, network, addr)
 			},
-		}}, nil
+		}}, v, nil
 	default:
-		return nil, fmt.Errorf("server url %q must be http or https", t.URL)
+		return nil, nil, fmt.Errorf("server url %q must be http or https", t.URL)
 	}
 }
 
-func newService(t Target) (tunnelsv1connect.TunnelServiceClient, error) {
-	hc, err := httpClient(t)
+func newService(t Target) (tunnelsv1connect.TunnelServiceClient, *tlsVerifier, error) {
+	hc, v, err := httpClient(t)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return tunnelsv1connect.NewTunnelServiceClient(hc, t.URL,
-		connect.WithInterceptors(bearer{token: t.Token})), nil
+		connect.WithInterceptors(bearer{token: t.Token})), v, nil
 }
 
 // Open dials the agent and returns the tunnel as a net.Conn, after the agent
@@ -122,7 +144,7 @@ func Open(ctx context.Context, t Target, endpoint string) (Conn, error) {
 
 // openConnect starts a Forward stream over Connect/HTTP2.
 func openConnect(ctx context.Context, t Target, endpoint string) (Conn, error) {
-	svc, err := newService(t)
+	svc, verifier, err := newService(t)
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +153,9 @@ func openConnect(ctx context.Context, t Target, endpoint string) (Conn, error) {
 	if err := stream.Send(&v1.ForwardRequest{
 		Payload: &v1.ForwardRequest_Open{Open: &v1.Open{Endpoint: endpoint}},
 	}); err != nil {
+		if ve := verifier.get(); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("open endpoint %q on %s: %w", endpoint, t.URL, err)
 	}
 
@@ -138,6 +163,9 @@ func openConnect(ctx context.Context, t Target, endpoint string) (Conn, error) {
 	// surfaces as an error here rather than as an unexplained EOF later.
 	resp, err := stream.Receive()
 	if err != nil {
+		if ve := verifier.get(); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("open endpoint %q on %s: %w", endpoint, t.URL, err)
 	}
 	if resp.GetOpened() == nil {

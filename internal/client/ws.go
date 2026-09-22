@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -22,16 +21,14 @@ import (
 // handshake cannot travel over HTTP/2 without RFC 8441 extended CONNECT,
 // which Go's server does not implement. ForceAttemptHTTP2 stays off so ALPN
 // cannot quietly negotiate h2 and break the upgrade.
-func wsHTTPClient(t Target) *http.Client {
+func wsHTTPClient(t Target) (*http.Client, *tlsVerifier) {
+	v := &tlsVerifier{}
 	return &http.Client{
 		Transport: &http.Transport{
 			ForceAttemptHTTP2: false,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: t.Insecure, //nolint:gosec // opt-in, dev only
-				NextProtos:         []string{"http/1.1"},
-			},
+			TLSClientConfig: wsTLSConfig(t, v),
 		},
-	}
+	}, v
 }
 
 // wsURL rewrites the agent URL for a WebSocket path.
@@ -74,11 +71,15 @@ func dialWS(ctx context.Context, t Target, path string, query url.Values) (*webs
 		header.Set("Authorization", "Bearer "+t.Token)
 	}
 
+	hc, verifier := wsHTTPClient(t)
 	c, resp, err := websocket.Dial(ctx, target, &websocket.DialOptions{
-		HTTPClient: wsHTTPClient(t),
+		HTTPClient: hc,
 		HTTPHeader: header,
 	})
 	if err != nil {
+		if ve := verifier.get(); ve != nil {
+			return nil, ve
+		}
 		// websocket.Dial reports only the status code, which would make an
 		// unknown endpoint read as a bare 404 while the Connect transport
 		// names the allowlist. The agent's reason is in the body, which Dial

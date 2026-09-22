@@ -53,18 +53,35 @@ Authorize the key you will connect with, then run the agent:
 ```sh
 san_tunnels server authorize "$(cat ~/.ssh/id_ed25519.pub)"
 
-san_tunnels server \
-  --listen 0.0.0.0:8443 \
-  --tls-cert /etc/san_tunnels/cert.pem \
-  --tls-key  /etc/san_tunnels/key.pem \
-  --token-file /etc/san_tunnels/token
+san_tunnels server
 ```
 
-The agent generates and persists its SSH host key on first run. Print its
-fingerprint so you can verify it from the entry host:
+That is the whole setup. On first run the agent generates and persists two
+things — an ed25519 SSH host key and a self-signed TLS certificate — and serves
+HTTPS over HTTP/2. There is no CA to run and no ACME challenge to satisfy,
+which matters because an agent behind NAT has no public DNS name to satisfy one
+with.
+
+For a real deployment, add a listen address and a token:
 
 ```sh
-san_tunnels server hostkey
+san_tunnels server \
+  --listen 0.0.0.0:8443 \
+  --token-file /etc/san_tunnels/token \
+  --tls-host box-01.example.com
+```
+
+`--tls-host` adds a name to the generated certificate; loopback and the
+machine's hostname are always included. To use your own certificate instead,
+pass `--tls-cert` and `--tls-key`. To serve cleartext behind an L4 proxy that
+terminates TLS, pass `--h2c` — it has to be asked for, because falling into it
+by forgetting a flag would leak the bearer token and every non-`shell` endpoint
+in plaintext.
+
+Print both fingerprints an entry host may want to pin:
+
+```sh
+san_tunnels server fingerprint
 ```
 
 ### 2. On the entry host
@@ -107,9 +124,11 @@ Host box-01
 ```
 
 Then `ssh box-01` works normally. On first connection, verify the fingerprint
-`ssh` shows against the `server hostkey` output above — after that it is
+`ssh` shows against the `server fingerprint` output above — after that it is
 pinned in `known_hosts`, which is what stops anything in the middle
-substituting its own key.
+substituting its own key. The TLS certificate is pinned separately, on the
+first `client check` or `client proxy`; see
+[Agent certificate trust](#client).
 
 ---
 
@@ -120,7 +139,9 @@ substituting its own key.
 | Flag | Default | Notes |
 |---|---|---|
 | `--listen` | `:8443` | **All interfaces.** Bind to a specific address if you can. |
-| `--tls-cert`, `--tls-key` | — | Required unless `--h2c`. |
+| `--tls-auto` | on, unless `--tls-cert` or `--h2c` is given | Generate and persist a self-signed certificate at `<config dir>/san_tunnels/tls_cert.pem`. Never regenerated once it exists: that would change the fingerprint and lock out every client that pinned it. |
+| `--tls-host` | — | Extra name or IP in the generated certificate, repeatable. Loopback and the machine's hostname are always included. |
+| `--tls-cert`, `--tls-key` | — | Use your own certificate. Must be given together. |
 | `--h2c` | off | Cleartext HTTP/2. Only behind an L4 proxy terminating TLS, or on a trusted network. Mutually exclusive with `--tls-cert`. |
 | `--token` | — | Bearer token. `$SAN_TUNNELS_TOKEN`. **Read [Security](#security) before omitting.** |
 | `--token-file` | — | Same, from a file. Mutually exclusive with `--token`. Prefer this: flags are visible in `ps`. |
@@ -131,7 +152,7 @@ substituting its own key.
 | `--ws-origin` | — | Browser origin allowed to open a WebSocket. Repeatable. Empty means same-origin only. |
 
 Subcommands: `server authorize <line \| ->`, `server hostkey`,
-`server endpoints`.
+`server fingerprint`, `server endpoints`.
 
 ### Client
 
@@ -146,6 +167,7 @@ Config file: `--config`, `$SAN_TUNNELS_CONFIG`, else
       "token": "…",
       "user": "deploy",
       "transport": "ws",
+      "tls_fingerprint": "SHA256:…",
       "insecure": false
     }
   }
@@ -158,7 +180,17 @@ Config file: `--config`, `$SAN_TUNNELS_CONFIG`, else
 | `token` | Bearer token. Overridable per run with `--token` / `$SAN_TUNNELS_TOKEN`. |
 | `user` | SSH user written into the generated `ssh` config block. |
 | `transport` | `connect` (default) or `ws`. See [Transports](#transports). |
-| `insecure` | Skip TLS verification. **Development only.** |
+| `tls_fingerprint` | Pin the agent's certificate, as printed by `server fingerprint`. Set, nothing else is accepted, and it overrides trust on first use. |
+| `insecure` | Skip TLS verification entirely. **Development only** — it disables pinning too. |
+
+**Agent certificate trust.** With nothing pinned, the first connection records
+the agent's certificate in `<config dir>/san_tunnels/known_agents.json` and
+says so on stderr; a different certificate is refused from then on. This is
+`StrictHostKeyChecking accept-new` and carries the same weakness — an attacker
+present for that very first connection is trusted afterwards — so pin
+`tls_fingerprint` when the agent is reachable over an untrusted path. A
+certificate that verifies against the system roots is accepted normally, so
+real PKI is not forced onto pinning.
 
 Commands: `client proxy <name>`, `client config <name>`, `client check <name>`,
 `client list`. Global `--log-level` (`debug`/`info`/`warn`/`error`,
@@ -176,7 +208,7 @@ Two doors onto the same agent. They diverge only in how they produce a
 | Wire | Connect RPC over HTTP/2 | WebSocket over HTTP/1.1 |
 | Path | `/san.tunnels.v1.TunnelService/…` | `/ws`, `/ws/ping` |
 | Survives h2-downgrading proxies | no — **hangs silently** | yes |
-| Keepalives | free (`http2.Transport` pings) | **none yet** — idle tunnels get reaped |
+| Keepalives | free (`http2.Transport` pings) | ping every 25s, 10s pong deadline, both ends |
 | Half-close | native | via a `close-write` control frame |
 | `client check` proves | reachability, token, **and duplex** | reachability and token only |
 
@@ -243,13 +275,16 @@ Two independent layers, deliberately:
 | Crypto | TLS (or `wss`) | SSH |
 | Credential | bearer token | SSH public key vs the agent's `authorized_keys` |
 | Decides | who may **open a tunnel** | who gets a **shell** |
-| Key material | `--tls-cert` / `--tls-key` | ed25519 host key, generated on first run |
+| Key material | self-signed cert generated on first run, or `--tls-cert` / `--tls-key` | ed25519 host key, generated on first run |
+| Pinned by | `tls_fingerprint`, or `known_agents.json` on first use | `known_hosts` |
 
 Because the SSH session is encrypted end to end, anything forwarding the
 tunnel — a proxy, a load balancer, a future hub — moves ciphertext. Host-key
 pinning via `known_hosts` is what stops it substituting its own key, so
 **verify the fingerprint on first connect**. TLS still matters: it protects the
-bearer token and the connection metadata, which sit outside the SSH layer.
+bearer token and the connection metadata, which sit outside the SSH layer — and
+because the agent generates its own certificate on first run, there is no
+reason left to run without it.
 
 ### ⚠️ Always set a token
 
@@ -273,7 +308,8 @@ is reachable by anything you do not control.
   file that ships anywhere.
 - Rotating the SSH host key means editing it out of every client's
   `known_hosts`. There is no `hostkey --rotate` yet; delete the file and
-  restart to regenerate.
+  restart to regenerate. The same applies to the TLS certificate and every
+  client's `known_agents.json`.
 - There is no rate limiting on token or key attempts, and no cap on concurrent
   tunnels.
 
@@ -298,9 +334,10 @@ agent, or check for a typo. `server endpoints` lists what is configured.
 to stderr; if you have wrapped the command in a script, check it is not
 echoing.
 
-**A `ws` tunnel dies after about a minute of idle.** Known gap — no WebSocket
-keepalives yet. A middlebox is reaping the idle connection. Run `tmux` on the
-target, or use the `connect` transport where h2 pings handle it.
+**A `ws` tunnel dies after about a minute of idle.** Both ends ping every 25s,
+so this should no longer happen. If it does, something in the path is dropping
+WebSocket control frames, or the idle timeout in front of the agent is under
+25s. Check the proxy first; `--transport connect` is the workaround.
 
 **`unable to authenticate`.** The key is not in the agent's `authorized_keys`,
 which is *not* the system one. Add it with `server authorize`.
@@ -351,8 +388,6 @@ Not built yet, in rough order of how likely you are to hit them:
 
 - **No `scp` / `sftp`.** No SFTP subsystem is registered, so file transfer does
   not work. Interactive sessions and `ssh host cmd` do.
-- **No WebSocket keepalives.** Idle `ws` tunnels get reaped by middleboxes at
-  60s or less.
 - **No startup check for a missing token.** See [Security](#security).
 - **Targets must be directly reachable.** The entry host dials the target. If
   your targets sit behind NAT this does not work yet — it needs the hub design

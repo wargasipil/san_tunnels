@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,15 @@ type ServeOptions struct {
 	Token   string
 	TLSCert string
 	TLSKey  string
+	// TLSAuto generates and persists a self-signed certificate at TLSCert and
+	// TLSKey when they do not exist yet. Clients pin it by fingerprint, the
+	// same way they already pin the SSH host key, so this needs no CA and no
+	// ACME challenge -- which matters because agents often have no public DNS
+	// name to satisfy one with.
+	TLSAuto bool
+	// TLSHosts are extra SAN entries for a generated certificate. Loopback and
+	// this machine's hostname are always included.
+	TLSHosts []string
 	// H2C serves cleartext HTTP/2. Only safe behind an L4 proxy that
 	// terminates TLS, or on a trusted network.
 	H2C bool
@@ -132,11 +142,30 @@ func Serve(ctx context.Context, o ServeOptions) error {
 		return errors.New("a service is required")
 	}
 	useTLS := o.TLSCert != "" && o.TLSKey != ""
-	if !useTLS && !o.H2C {
-		return errors.New("no transport configured: pass --tls-cert and --tls-key, or --h2c to serve cleartext behind an L4 proxy")
-	}
 	if useTLS && o.H2C {
 		return errors.New("--h2c and --tls-cert are mutually exclusive")
+	}
+	if !useTLS && !o.H2C {
+		return errors.New("no transport configured: pass --tls-cert and --tls-key, --tls-auto for a self-signed certificate, or --h2c to serve cleartext behind an L4 proxy")
+	}
+
+	// A generated certificate is loaded up front so its fingerprint can be
+	// logged at startup: that string is what a client pins, and it is useless
+	// if an operator has to go digging for it.
+	var generated *tls.Certificate
+	if useTLS && o.TLSAuto {
+		cert, err := LoadOrCreateTLSCert(o.TLSCert, o.TLSKey, o.TLSHosts)
+		if err != nil {
+			return err
+		}
+		fp, err := LeafFingerprint(cert)
+		if err != nil {
+			return err
+		}
+		generated = cert
+		log.Info("tls certificate ready",
+			"cert", o.TLSCert, "fingerprint", fp,
+			"hint", "pin this as tls_fingerprint in the client config")
 	}
 
 	srv := &http.Server{
@@ -157,6 +186,17 @@ func Serve(ctx context.Context, o ServeOptions) error {
 	go func() {
 		if useTLS {
 			log.Info("agent listening", "addr", o.Listen, "transport", "https/h2")
+			if generated != nil {
+				// Serve the already-loaded pair rather than re-reading the
+				// files, so startup cannot race a concurrent regeneration.
+				srv.TLSConfig = &tls.Config{
+					Certificates: []tls.Certificate{*generated},
+					MinVersion:   tls.VersionTLS12,
+					NextProtos:   []string{"h2", "http/1.1"},
+				}
+				errc <- srv.ListenAndServeTLS("", "")
+				return
+			}
 			errc <- srv.ListenAndServeTLS(o.TLSCert, o.TLSKey)
 			return
 		}

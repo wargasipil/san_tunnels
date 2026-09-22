@@ -27,6 +27,17 @@ type Agent struct {
 	User string `json:"user,omitempty"`
 	// Insecure skips TLS verification. Development only.
 	Insecure bool `json:"insecure,omitempty"`
+	// TLSFingerprint pins the agent's certificate, as printed by
+	// `san_tunnels server fingerprint`. Set, nothing else is accepted, and it
+	// overrides whatever trust on first use recorded.
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
+	// Port is the local port `client connect` binds for this agent. Unset, it
+	// takes a free one.
+	//
+	// Worth setting for anything you connect to repeatedly: ssh records the
+	// port in known_hosts, and GUI clients that cannot set HostKeyAlias have
+	// nothing but the port to tell one agent from another.
+	Port int `json:"port,omitempty"`
 	// Transport is "connect" (the default) or "ws". Set it to "ws" only when
 	// something in the path cannot carry a full-duplex HTTP/2 stream; the
 	// agent's own error message says so when that is the case.
@@ -63,6 +74,41 @@ func LoadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
+// Save writes the config back, creating its directory if needed.
+//
+// 0600, because this file holds bearer tokens. The write goes to a temporary
+// file first and is then renamed over the original, so an interrupted save
+// cannot leave a half-written config where a working one used to be.
+func (c *Config) Save(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	b = append(b, '\n')
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace config %s: %w", path, err)
+	}
+	return nil
+}
+
+// Set adds or replaces one agent.
+func (c *Config) Set(name string, a Agent) {
+	if c.Agents == nil {
+		c.Agents = map[string]Agent{}
+	}
+	c.Agents[name] = a
+}
+
 // Resolve turns an agent name into a Target.
 func (c *Config) Resolve(name string) (Target, error) {
 	a, ok := c.Agents[name]
@@ -80,13 +126,18 @@ func (c *Config) Resolve(name string) (Target, error) {
 	if err != nil {
 		return Target{}, fmt.Errorf("agent %q: %w", name, err)
 	}
+	if a.Port < 0 || a.Port > 65535 {
+		return Target{}, fmt.Errorf("agent %q has port %d, which is not a port number", name, a.Port)
+	}
 	return Target{
-		Name:      name,
-		URL:       a.URL,
-		Token:     a.Token,
-		User:      a.User,
-		Insecure:  a.Insecure,
-		Transport: transport,
+		Name:           name,
+		URL:            a.URL,
+		Token:          a.Token,
+		User:           a.User,
+		Insecure:       a.Insecure,
+		Transport:      transport,
+		TLSFingerprint: a.TLSFingerprint,
+		Port:           a.Port,
 	}, nil
 }
 
