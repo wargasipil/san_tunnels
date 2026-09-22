@@ -48,67 +48,63 @@ Copy the one binary to the target host. Nothing else is installed there — no
 
 ### 1. On the target host
 
-Authorize the key you will connect with, then run the agent:
-
 ```sh
+san_tunnels server init
 san_tunnels server authorize "$(cat ~/.ssh/id_ed25519.pub)"
-
-san_tunnels server
+san_tunnels server --listen 0.0.0.0:8443 --tls-host box-01.example.com
 ```
 
-That is the whole setup. On first run the agent generates and persists two
-things — an ed25519 SSH host key and a self-signed TLS certificate — and serves
-HTTPS over HTTP/2. There is no CA to run and no ACME challenge to satisfy,
-which matters because an agent behind NAT has no public DNS name to satisfy one
-with.
+`init` generates and persists three things: an ed25519 SSH host key, a
+self-signed TLS certificate, and a 32-byte random token. There is no CA to run
+and no ACME challenge to satisfy, which matters because an agent behind NAT has
+no public DNS name to satisfy one with.
 
-For a real deployment, add a listen address and a token:
-
-```sh
-san_tunnels server \
-  --listen 0.0.0.0:8443 \
-  --token-file /etc/san_tunnels/token \
-  --tls-host box-01.example.com
-```
+**The token is the part that matters.** It used to be something you had to
+invent, so the common outcome was an agent with none — and an agent with no
+token leaves every allowlisted TCP endpoint reachable by anyone who can dial
+the port, since only `shell` has SSH behind it. `init` writes one by default.
+It never replaces an existing token without `--force`, because that would lock
+out every client already holding it.
 
 `--tls-host` adds a name to the generated certificate; loopback and the
-machine's hostname are always included. To use your own certificate instead,
-pass `--tls-cert` and `--tls-key`. To serve cleartext behind an L4 proxy that
+machine's hostname are always included. To use your own certificate, pass
+`--tls-cert` and `--tls-key`. To serve cleartext behind an L4 proxy that
 terminates TLS, pass `--h2c` — it has to be asked for, because falling into it
 by forgetting a flag would leak the bearer token and every non-`shell` endpoint
 in plaintext.
 
-Print both fingerprints an entry host may want to pin:
+### 2. Hand the entry host a registration token
 
 ```sh
-san_tunnels server fingerprint
+san_tunnels server invite --url https://box-01.example:8443 --user deploy
+# san1_eyJ1cmwiOiJodHRwczovL2JveC0wMS5leGFtcGxlOjg0NDMi...
 ```
 
-### 2. On the entry host
+That one string carries the URL, the token, the TLS certificate fingerprint and
+the SSH host key fingerprint. **Treat it as a password** — it grants a tunnel to
+anyone holding it.
 
-Write `~/.config/san_tunnels/config.json` (`%AppData%\san_tunnels\config.json`
-on Windows):
-
-```json
-{
-  "agents": {
-    "box-01": {
-      "url": "https://box-01.example:8443",
-      "token": "the-same-token",
-      "user": "deploy"
-    }
-  }
-}
-```
-
-Prove the path works before involving `ssh`, which fails far less clearly:
+On the entry host:
 
 ```sh
+san_tunnels client add box-01 --from san1_eyJ1cmwiOi...
 san_tunnels client check box-01
 # ok: box-01 is reachable and the path is full-duplex
 ```
 
+The reason to prefer the invite over typing the URL and token by hand is that
+the certificate fingerprint travels **out of band**, so it is pinned before the
+first connection and there is no trust-on-first-use window to eyeball. Without
+`--from`, `client add` reads the certificate off the connection and pins that
+instead — which proves nothing by itself, so it tells you to compare it against
+`server fingerprint` on the agent.
+
+Run `client add` with no arguments and it prompts, as long as stdin is a
+terminal; in a pipeline a missing value is an error rather than a hang.
+
 ### 3. Wire it into ssh
+
+`client add` already printed the block. To get it again:
 
 ```sh
 san_tunnels client config box-01 >> ~/.ssh/config
@@ -151,8 +147,9 @@ first `client check` or `client proxy`; see
 | `--endpoint` | — | `name=host:port`, repeatable. See [Endpoints](#endpoints). |
 | `--ws-origin` | — | Browser origin allowed to open a WebSocket. Repeatable. Empty means same-origin only. |
 
-Subcommands: `server authorize <line \| ->`, `server hostkey`,
-`server fingerprint`, `server endpoints`.
+Subcommands: `server init`, `server invite --url <url>`,
+`server authorize <line \| ->`, `server hostkey`, `server fingerprint`,
+`server endpoints`.
 
 ### Client
 
@@ -180,8 +177,11 @@ Config file: `--config`, `$SAN_TUNNELS_CONFIG`, else
 | `token` | Bearer token. Overridable per run with `--token` / `$SAN_TUNNELS_TOKEN`. |
 | `user` | SSH user written into the generated `ssh` config block. |
 | `transport` | `connect` (default) or `ws`. See [Transports](#transports). |
+| `port` | Local port for `client connect`. Unset, it takes a free one. See [Local ports](#local-ports). |
 | `tls_fingerprint` | Pin the agent's certificate, as printed by `server fingerprint`. Set, nothing else is accepted, and it overrides trust on first use. |
 | `insecure` | Skip TLS verification entirely. **Development only** — it disables pinning too. |
+
+Written by `client add`; you rarely need to edit it by hand.
 
 **Agent certificate trust.** With nothing pinned, the first connection records
 the agent's certificate in `<config dir>/san_tunnels/known_agents.json` and
@@ -192,9 +192,11 @@ present for that very first connection is trusted afterwards — so pin
 certificate that verifies against the system roots is accepted normally, so
 real PKI is not forced onto pinning.
 
-Commands: `client proxy <name>`, `client config <name>`, `client check <name>`,
-`client list`. Global `--log-level` (`debug`/`info`/`warn`/`error`,
-`$SAN_TUNNELS_LOG_LEVEL`) — always to stderr, never stdout.
+Commands: `client add <name> [url]`, `client proxy <name>`,
+`client connect <name>`, `client config <name>`, `client check <name>`,
+`client list`, `client hosts`. Global `--log-level`
+(`debug`/`info`/`warn`/`error`, `$SAN_TUNNELS_LOG_LEVEL`) — always to stderr,
+never stdout.
 
 ---
 
@@ -258,11 +260,64 @@ san_tunnels server endpoints    # list the allowlist
 
 ```sh
 # tunnel Postgres to a local port
-san_tunnels client proxy --endpoint postgres box-01
+san_tunnels client connect --endpoint postgres box-01
+# listening on 127.0.0.1:52341 -> box-01 (postgres)
+#   point any client at localhost:52341
 ```
+
+Use `connect`, not `proxy`, for these: `proxy` writes the stream to stdout,
+which `psql` cannot be pointed at.
 
 > ⚠️ **TCP endpoints are protected by the bearer token alone.** Unlike `shell`,
 > they do not pass through SSH authentication. See [Security](#security).
+
+---
+
+## Local ports
+
+`client connect` binds a loopback port and gives each connection its own
+tunnel. It is the counterpart to `proxy`, for everything that cannot run an ssh
+ProxyCommand: GUI SSH clients (PuTTY, WinSCP, MobaXterm), database tools, and
+anything that only knows how to reach a host and a port.
+
+```sh
+san_tunnels client connect box-01
+# listening on 127.0.0.1:52341 -> box-01 (shell)
+#
+#   ssh -p 52341 -o HostKeyAlias=box-01.tunnels.internal deploy@localhost
+```
+
+**Why `HostKeyAlias`.** Without it every agent reached this way looks like
+`localhost` to `ssh`, so they share one `known_hosts` entry keyed on the port —
+and the port moving then reads as the host key having changed. The alias keys
+it on the agent instead, so pinning survives.
+
+**Pin the port** for anything you connect to repeatedly, especially from a GUI
+tool that saves a profile:
+
+```json
+"box-01": { "url": "…", "token": "…", "port": 2222 }
+```
+
+A configured port is bound exactly or not at all. It is never moved to a free
+one, because `ssh` records it and drifting would look like a changed host key.
+If the port is taken, `connect` says so and stops.
+
+**GUI clients have no `HostKeyAlias`.** They file host keys under whatever they
+connected to, so they need real names:
+
+```sh
+san_tunnels client hosts
+# add to C:\Windows\System32\drivers\etc\hosts (needs Administrator)
+# 127.0.0.1  box-01.tunnels.internal
+```
+
+It prints rather than edits — the hosts file is shared with every process on
+the machine and needs administrator rights. `ssh` itself needs none of this.
+
+> ⚠️ While a `connect` port is open, **any local process can use it**. SSH key
+> auth still gates `shell`, but a TCP endpoint has no second layer. Fine on a
+> single-user laptop; think twice on a shared build box.
 
 ---
 
@@ -288,18 +343,18 @@ reason left to run without it.
 
 ### ⚠️ Always set a token
 
-`--token` / `--token-file` is optional, and when it is omitted the agent
-**accepts every request without authentication**. There is currently no
-startup warning for this.
+`server init` writes one, so the easy path is now the safe one. But the token
+is still **optional**, and an agent started without one **accepts every request
+without authentication**. There is no startup warning for this.
 
-For `shell` that is partly covered — SSH key auth still stands between a
-caller and a prompt. **For TCP endpoints there is no second layer at all**: an
-agent with `--endpoint postgres=…` and no token is an open proxy to that
-service for anyone who can reach the listener. Combined with `--listen`
-defaulting to all interfaces, one forgotten flag is enough.
+For `shell` that is partly covered — SSH key auth still stands between a caller
+and a prompt. **For TCP endpoints there is no second layer at all**: an agent
+with `--endpoint postgres=…` and no token is an open proxy to that service for
+anyone who can reach the listener. Combined with `--listen` defaulting to all
+interfaces, one forgotten flag is enough.
 
-Until a startup check exists, treat the token as mandatory whenever the agent
-is reachable by anything you do not control.
+So: run `server init` before `server`, and pass `--token-file`. Treat the token
+as mandatory whenever the agent is reachable by anything you do not control.
 
 ### Other operational notes
 
@@ -369,9 +424,10 @@ protos/san/tunnels/v1/tunnel.proto   TunnelService: Forward + Ping
 gen/                                 buf output
 cmd/san_tunnels/main.go              urfave/cli v3 tree
 internal/streamconn/                 net.Conn over stream callbacks
-internal/wsconn/                     net.Conn over a WebSocket + framing convention
-internal/agent/                      keys, sshd, service, ws, http
-internal/client/                     client, ws, proxy, config
+internal/wsconn/                     net.Conn over a WebSocket + framing, keepalive
+internal/invite/                     the registration blob, spoken by both sides
+internal/agent/                      keys, tlskey, sshd, service, ws, http
+internal/client/                     client, ws, proxy, connect, trust, probe, config
 ```
 
 The seam worth knowing: `Service.Handle(ctx, endpoint, conn, ack)` takes an
@@ -388,7 +444,12 @@ Not built yet, in rough order of how likely you are to hit them:
 
 - **No `scp` / `sftp`.** No SFTP subsystem is registered, so file transfer does
   not work. Interactive sessions and `ssh host cmd` do.
-- **No startup check for a missing token.** See [Security](#security).
+- **The SSH username is decorative.** The shell always runs as the user the
+  agent itself runs as — there is no `setuid` and no lookup, so `ssh anyone@…`
+  gets the same session. Everyone holding an authorized key gets the same
+  shell; there is no per-user separation.
+- **No startup check for a missing token.** `server init` generates one, but
+  `server` still starts happily without. See [Security](#security).
 - **Targets must be directly reachable.** The entry host dials the target. If
   your targets sit behind NAT this does not work yet — it needs the hub design
   sketched in the spec, which is an open decision, not an implementation gap.
